@@ -1,0 +1,36 @@
+# =============================================================================
+# Evaluation Configuration
+# =============================================================================
+
+evaluation:
+  # Tournament settings
+  tournament:
+    num_games_per_matchup: 100
+    control_for_turn_order: true   # Agent plays as both first and second player
+
+  # Matchups to evaluate
+  matchups:
+    - map_type: "MINI"
+      vps_to_win: 6
+      opponents:
+        - "WeightedRandomPlayer"
+
+    - map_type: "BASE"
+      vps_to_win: 10
+      opponents:
+        - "WeightedRandomPlayer"
+
+    - map_type: "MINI"
+      vps_to_win: 6
+      opponents:
+        - "AlphaBetaPlayer"
+
+    - map_type: "BASE"
+      vps_to_win: 10
+      opponents:
+        - "AlphaBetaPlayer"
+        - "ValueFunctionPlayer"
+
+  # Output
+  output_dir: "./results/"
+  save_game_logs: true

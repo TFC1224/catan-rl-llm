@@ -1,0 +1,61 @@
+# =============================================================================
+# GRPO (Group Relative Policy Optimization) Configuration
+# =============================================================================
+
+grpo:
+  training:
+    output_dir: "./checkpoints/grpo/"
+    num_train_epochs: 1
+    per_device_train_batch_size: 4
+    gradient_accumulation_steps: 4
+    learning_rate: 5.0e-5
+    lr_scheduler_type: "cosine"
+    warmup_ratio: 0.1
+
+    # GRPO specific
+    num_generations: 4          # K candidates per prompt (group size for relative comparison)
+    beta: 0.04                  # KL divergence penalty — lower allows more policy movement
+    temperature: 1.0            # Exploration temperature (1.0 = modest diversity, 1.2 causes hallucinations)
+
+    # Sequence lengths
+    max_prompt_length: 2048     # Game state text fits within 2048 tokens
+    max_completion_length: 128  # Action JSON output is short (~30-50 tokens)
+
+    # Logging
+    logging_steps: 5
+    save_steps: 200
+    eval_steps: 200
+    report_to: "none"
+
+  # Reward function parameters
+  reward:
+    validity_penalty: -0.5      # Penalty for invalid/unparseable actions
+    simulation_rollouts: 3      # Number of rollouts per candidate (for stability)
+    use_dense_reward: false     # Whether to add incremental VP-based rewards
+
+# ---- Progressive Curriculum ----
+curriculum:
+  iterations:
+    - name: "iter1_mini_random"
+      map_type: "MINI"
+      vps_to_win: 6
+      opponents: ["WeightedRandomPlayer", "WeightedRandomPlayer"]
+      num_rollout_games: 100
+
+    - name: "iter2_mini_mixed"
+      map_type: "MINI"
+      vps_to_win: 6
+      opponents: ["WeightedRandomPlayer", "AlphaBetaPlayer"]
+      num_rollout_games: 150
+
+    - name: "iter3_base_random"
+      map_type: "BASE"
+      vps_to_win: 10
+      opponents: ["WeightedRandomPlayer", "WeightedRandomPlayer"]
+      num_rollout_games: 100
+
+    - name: "iter4_base_alphabeta"
+      map_type: "BASE"
+      vps_to_win: 10
+      opponents: ["AlphaBetaPlayer", "AlphaBetaPlayer"]
+      num_rollout_games: 100

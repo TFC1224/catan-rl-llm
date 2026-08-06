@@ -1,0 +1,29 @@
+[project]
+name = "catan-rl-llm"
+version = "0.1.0"
+description = "Training Qwen3-8B to play Settlers of Catan using LlamaGym + GRPO"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.1.0",
+    "transformers>=4.45.0",
+    "trl>=0.12.0",
+    "peft>=0.12.0",
+    "accelerate>=0.28.0",
+    "bitsandbytes>=0.43.0",
+    "datasets>=3.0.0",
+    "catanatron-gym>=4.0.0",
+    "gymnasium>=0.29.0",
+    "vllm>=0.5.0",
+    "wandb>=0.16.0",
+    "pyyaml>=6.0",
+    "tqdm>=4.66.0",
+    "matplotlib>=3.7.0",
+    "seaborn>=0.12.0",
+]
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]

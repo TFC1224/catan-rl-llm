@@ -1,0 +1,51 @@
+# =============================================================================
+# Default Configuration for Catan RL + LLM Project
+# =============================================================================
+
+# ---- Model Configuration ----
+model:
+  name: "/root/autodl-tmp/Qwen/Qwen3-8B/"
+  dtype: "bfloat16"
+  load_in_4bit: true
+  bnb_4bit_compute_dtype: "bfloat16"
+  bnb_4bit_quant_type: "nf4"
+  bnb_4bit_use_double_quant: true
+  attn_implementation: "sdpa"
+  trust_remote_code: true
+
+# ---- LoRA Configuration ----
+lora:
+  r: 16
+  alpha: 32
+  dropout: 0.05
+  target_modules:
+    - "q_proj"
+    - "k_proj"
+    - "v_proj"
+    - "o_proj"
+    - "gate_proj"
+    - "up_proj"
+    - "down_proj"
+
+# ---- Environment Configuration ----
+env:
+  map_type: "MINI"          # MINI (7 tiles) or BASE (19 tiles)
+  vps_to_win: 6             # 6 for MINI, 10 for BASE
+  max_turns: 200
+  representation: "mixed"   # Observation representation mode
+
+# ---- Generation Configuration ----
+generation:
+  max_new_tokens: 128
+  temperature: 0.8
+  top_p: 0.9
+  top_k: 50
+  do_sample: true
+  repetition_penalty: 1.1
+
+# ---- Paths ----
+paths:
+  data_dir: "./data"
+  checkpoint_dir: "./checkpoints"
+  results_dir: "./results"
+  experiment_dir: "./experiments"
