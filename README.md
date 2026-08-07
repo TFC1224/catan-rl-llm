@@ -1,6 +1,6 @@
 # catan-rl-llm
 
-用 LLM 玩《卡坦岛》：以 Qwen3-8B 为基座，通过 SFT 冷启动 + GRPO 强化学习训练一个卡坦岛 AI 玩家。
+用 LLM 玩《卡坦岛》：以 Qwen3-8B 为基座，通过 SFT（训练基本策略） + GRPO 强化学习训练一个卡坦岛 AI 玩家。
 
 ## 目录
 
@@ -14,9 +14,7 @@
 
 ## 背景与目标
 
-现有 LLM 玩游戏的研究多集中在棋类与简单回合制游戏上。《卡坦岛》需要资源管理、路径规划与多人博弈，是一个更有挑战性的 RL 测试环境。
-
-本项目复用了 LlamaGym 的 agent 模式（`get_system_prompt` / `format_observation` / `extract_action`），用 TRL 的 GRPO 做训练。路线是标准的"先 SFT 模仿专家，再 RL 优化策略"。
+现有 LLM 游戏智能体的研究多局限于棋类或简单回合制游戏。《卡坦岛》兼具资源管理、路径规划与多人博弈等复杂要素，是更具挑战性的 RL 测试环境。本项目基于 LlamaGym 构建 LLM-Agent 交互框架，采用 TRL 实现 GRPO 训练，沿"先 SFT 学会基本策略，再 RL 在线优化"的技术路线，探索 LLM 在复杂策略游戏中的决策能力边界。
 
 ## 当前进展
 
@@ -24,13 +22,13 @@
 |---|---|---|
 | Phase 1 环境搭建 | ✅ 完成 | Catanatron + Qwen3-8B + TRL 环境验证通过 |
 | Phase 2 Agent 实现 | ✅ 完成 | 观察格式化、动作解析、3 套系统提示词 |
-| Phase 3 SFT 冷启动 | ✅ 完成 | 100% 动作合法性；MINI 地图胜率 33% |
-| Phase 4 GRPO RL | ❌ 受阻 | SFT 后模型 entropy 塌陷（0.01–0.06），组内生成雷同，无学习信号 |
+| Phase 3 SFT 基础策略训练 | ✅ 完成 | 100% 动作合法性；MINI 地图胜率 33% |
+| Phase 4 GRPO RL | ❌ 受阻 | SFT 后模型 entropy 过低，组内生成雷同，学习信号少 |
 | SimSFT 模拟引导精调 | 🔄 实验 | 数据生成 + 训练已完成，评估未完成 |
 
-**核心问题**：SFT 训练导致模型输出过于确定性，K=4 次生成几乎一致，GRPO 的 advantage 趋近 0，无法学习。细节见 [PROGRESS.md](PROGRESS.md)。
+**核心问题**：SFT 训练导致模型输出过于确定性，学习效率低。细节见 [PROGRESS.md](PROGRESS.md)。
 
-**下一步计划**：按 AESL（ICLR 2026）论文思路改进冷启动 SFT——监控输出多样性并在熵峰处早停，用自适应加权损失保护 base 分布，使 GRPO 重新可获得梯度。
+**未来展望**：结束当前SimSFT后，按 AESL（ICLR 2026）论文思路改进冷启动 SFT——监控输出多样性并在熵峰处早停，观察是否提升后续训练效果。
 
 ## 项目结构
 
