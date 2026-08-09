@@ -10,7 +10,7 @@ build/
 # Virtual environments
 venv/
 .venv/
-/env/
+env/
 
 # IDE
 .vscode/
@@ -23,21 +23,21 @@ venv/
 *.ipynb_checkpoints/
 
 # Model checkpoints
-/checkpoints/
+checkpoints/
 
 # Data
-/data/
+data/
 
 # Results
-/results/
+results/
 
 # Environment
 .env
 *.env.local
 
 # Wandb
-/wandb/
-/wandb/**/*
+wandb/
+wandb/**/*
 
 # OS
 .DS_Store
@@ -45,7 +45,7 @@ Thumbs.db
 
 # Logs
 *.log
-/logs/
+logs/
 
 # HuggingFace
 .cache/huggingface/

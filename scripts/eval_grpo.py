@@ -1,132 +1,105 @@
 #!/usr/bin/env python3
 """
-Quick evaluation script for GRPO-trained Catan agent.
-
-Runs a few games to measure action validity rate and win rate
-against baseline opponents.
+Evaluate GRPO-trained models standalone (no VF guardrail at inference).
 
 Usage:
-    python scripts/eval_grpo.py --model checkpoints/grpo/iter1/ --games 10
+    python scripts/eval_grpo.py --model checkpoints/grpo/checkpoint-3/ --games 5
 """
 
-import argparse
-import logging
-import os
-import sys
+import argparse, json, logging, os, random, sys, time
+import numpy as np
+import torch
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+_FORK_CORE = '/root/autodl-tmp/catan-rl-llm/Catanatron-main/catanatron'
+_PROJ = '/root/autodl-tmp/catan-rl-llm/catan-rl-llm'
+for _p in [_FORK_CORE, _PROJ, os.path.join(_PROJ, 'src')]:
+    if _p not in sys.path: sys.path.insert(0, _p)
 
-from catanatron.models.player import Color
-from catanatron_gym.envs.catanatron_env import CatanatronEnv
+from catanatron import Game, Color
+from catanatron.models.player import Player
 from catanatron.players.weighted_random import WeightedRandomPlayer
-
-from src.catan_rl.agent.qwen_agent import QwenCatanAgent
+from catan_rl.agent.qwen_agent import QwenCatanAgent
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
 
-def evaluate(model_path: str, num_games: int = 10, map_type: str = "MINI", vps: int = 6):
-    """Evaluate a trained model against WeightedRandomPlayer."""
+class StandalonePlayer(Player):
+    """Pure LLM — no guardrail. Tests GRPO model quality."""
 
-    logger.info(f"Loading agent from: {model_path}")
-    agent = QwenCatanAgent(
-        model_name="/root/autodl-tmp/Qwen/Qwen3-8B/",
-        lora_path=model_path,
-        load_in_4bit=True,
-    )
+    def __init__(self, color, agent):
+        super().__init__(color); self.agent = agent; self.total = 0
 
-    results = {"WIN": 0, "LOSS": 0, "DRAW": 0, "valid_actions": 0, "total_actions": 0}
-
-    for game_idx in range(num_games):
+    def decide(self, game, playable_actions):
+        actions = list(playable_actions)
+        if len(actions) <= 1: self.total += 1; return actions[0] if actions else None
+        self.total += 1
         try:
-            enemies = [WeightedRandomPlayer(Color.RED)]
-            env = CatanatronEnv(config={
-                "map_type": map_type,
-                "vps_to_win": vps,
-                "enemies": enemies,
-                "representation": "mixed",
-            })
+            r = self.agent.act(observation=game.state, valid_actions=actions, player_index=0)
+            idx = r.action_index
+            if not (0 <= idx < len(actions)): idx = 0
+        except Exception: idx = 0
+        return actions[idx]
 
-            obs = env.reset()
-            done = False
-            agent.reset_episode()
-            turn = 0
 
-            while not done and turn < 300:
-                state = env.game.state
-                playable = list(state.playable_actions)
-                int_actions = env.get_valid_actions()
+def run_eval(checkpoint_path, num_games=5, seed=42):
+    random.seed(seed); np.random.seed(seed)
 
-                if not int_actions:
-                    break
+    logger.info(f"Loading GRPO model: {checkpoint_path}")
+    agent = QwenCatanAgent.from_pretrained(
+        model_name="/root/autodl-tmp/Qwen/Qwen3-8B/", device="cuda", load_in_4bit=True,
+        lora_path=checkpoint_path, prompt_version="v1")
+    agent.max_new_tokens = 16; agent.temperature = 0.1; agent.do_sample = True
 
-                # Agent decision
-                agent_action = agent.act(state, playable, player_index=0)
-                results["total_actions"] += 1
+    colors = [Color.RED, Color.BLUE, Color.WHITE, Color.ORANGE]
+    results = []; t_start = time.time()
 
-                if agent_action.is_valid:
-                    results["valid_actions"] += 1
+    for i in range(num_games):
+        gs = seed + i * 100
+        random.seed(gs); shuffled = list(colors); random.shuffle(shuffled)
+        ac = shuffled[0]
+        player = StandalonePlayer(ac, agent)
+        opponents = [WeightedRandomPlayer(c) for c in shuffled[1:]]
+        all_players = [player] + opponents; random.shuffle(all_players)
 
-                # Map to action space index
-                seq_idx = agent_action.action_index
-                if seq_idx is None or seq_idx < 0 or seq_idx >= len(int_actions):
-                    seq_idx = 0
-                action_idx = int_actions[seq_idx]
-
-                obs, reward, terminated, truncated, info = env.step(action_idx)
-                done = terminated or truncated
-                agent.assign_reward(reward)
-                turn += 1
-
-            # Outcome
-            winner = env.game.winning_color()
-            if winner and "BLUE" in str(winner).upper():
-                results["WIN"] += 1
-            elif winner:
-                results["LOSS"] += 1
-            else:
-                results["DRAW"] += 1
-
-            env.close()
-
-            logger.info(
-                f"Game {game_idx+1}/{num_games}: "
-                f"W:{results['WIN']} L:{results['LOSS']} D:{results['DRAW']} | "
-                f"Valid: {results['valid_actions']}/{results['total_actions']}"
-            )
-
+        logger.info(f"Game {i+1}/{num_games} (seed={gs})...")
+        gt = time.time()
+        try:
+            game = Game(all_players, vps_to_win=10); winner = game.play()
+            outcome = "WIN" if winner == ac else "LOSS"
         except Exception as e:
-            logger.error(f"Game {game_idx+1} crashed: {e}")
-            import traceback; traceback.print_exc()
-            continue
+            logger.warning(f"Error: {e}"); outcome = "ERROR"
 
-    # Summary
-    total = results["WIN"] + results["LOSS"] + results["DRAW"]
-    win_rate = results["WIN"] / max(total, 1) * 100
-    validity = results["valid_actions"] / max(results["total_actions"], 1) * 100
+        turns = game.state.num_turns if hasattr(game, 'state') else 0
+        game_time = time.time() - gt
+        torch.cuda.empty_cache()
+        results.append({"outcome": outcome, "turns": turns, "game_time_s": game_time})
+        wins = sum(1 for r in results if r["outcome"] == "WIN")
+        elapsed = time.time() - t_start
+        logger.info(f"  Game {i+1}/{num_games} | {wins}W/{i+1-wins}L | "
+                   f"{turns}t/{game_time:.0f}s | {elapsed:.0f}s total")
 
-    logger.info("=" * 50)
-    logger.info(f"Evaluation Complete: {total} games")
-    logger.info(f"  Win rate: {win_rate:.1f}% ({results['WIN']}/{total})")
-    logger.info(f"  Loss rate: {results['LOSS'] / max(total, 1) * 100:.1f}%")
-    logger.info(f"  Draw rate: {results['DRAW'] / max(total, 1) * 100:.1f}%")
-    logger.info(f"  Action validity: {validity:.1f}% ({results['valid_actions']}/{results['total_actions']})")
-    logger.info("=" * 50)
-
-    return results
+    wins = sum(1 for r in results if r["outcome"] == "WIN")
+    completed = sum(1 for r in results if r["outcome"] != "ERROR")
+    wr = wins / max(completed, 1)
+    total_time = time.time() - t_start
+    logger.info(f"GRPO Result: {wins}/{completed} ({wr:.1%}) | {total_time:.0f}s ({total_time/60:.1f}min)")
+    return {"win_rate": wr, "wins": wins, "games": completed, "time_s": total_time}
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--model", type=str, required=True)
-    parser.add_argument("--games", type=int, default=10)
-    parser.add_argument("--map", type=str, default="MINI")
-    parser.add_argument("--vps", type=int, default=6)
-    args = parser.parse_args()
+    p = argparse.ArgumentParser()
+    p.add_argument("--model", type=str, default="checkpoints/grpo/checkpoint-3/")
+    p.add_argument("--games", type=int, default=5)
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--output", type=str, default=None)
+    args = p.parse_args()
 
-    evaluate(args.model, args.games, args.map, args.vps)
+    result = run_eval(args.model, args.games, args.seed)
 
+    if args.output:
+        os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
+        with open(args.output, "w") as f: json.dump(result, f, indent=2)
 
 if __name__ == "__main__":
     main()

@@ -1,209 +1,179 @@
 #!/usr/bin/env python3
 """
-Generate GRPO rollout data using fast bot-vs-bot gameplay.
+Generate GRPO training data from VF-Guard games.
+Records ALL actions with VF scores for group-relative preference learning.
 
-Unlike scripts/rollout.py (which uses the model and is slow), this script
-uses bot opponents (VictoryPointPlayer) to quickly generate game states for
-GRPO training. The model only needs the game states, not the action choices —
-those are generated during GRPO training.
+Key difference from VF-Distill v2:
+- VF-Distill: only saves BEST action (override-only filtering) → ~439 examples
+- GRPO: saves ALL actions with scores → ~10,000+ examples with relative rankings
 
 Usage:
-    python scripts/generate_grpo_data.py --num_games 100 --output data/grpo/iter1/
+    python scripts/generate_grpo_data.py --games 100 --output data/grpo/
 """
 
-import argparse
-import json
-import logging
-import os
-import pickle
-import sys
-import base64
-
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
-
+import argparse, json, logging, os, random, sys, time
 import numpy as np
-from catanatron.models.player import Color
-from catanatron_gym.envs.catanatron_env import CatanatronEnv
+
+_FORK_CORE = '/root/autodl-tmp/catan-rl-llm/Catanatron-main/catanatron'
+_FORK_EXP = '/root/autodl-tmp/catan-rl-llm/Catanatron-main/catanatron_experimental'
+_CATANATRON_ROOT = '/root/autodl-tmp/catan-rl-llm/Catanatron-main/'
+_PROJ = '/root/autodl-tmp/catan-rl-llm/catan-rl-llm'
+for _p in [_FORK_CORE, _FORK_EXP, _CATANATRON_ROOT, _PROJ, os.path.join(_PROJ, 'src')]:
+    if _p not in sys.path: sys.path.insert(0, _p)
+
+from catanatron import Game, Color
+from catanatron.models.player import Player
 from catanatron.players.weighted_random import WeightedRandomPlayer
-from catanatron.players.search import VictoryPointPlayer
-from transformers import AutoTokenizer
+from catanatron.players.minimax import get_value_fn
+from catan_rl.rl.value import CONTENDER_WEIGHTS
+from catan_rl.agent.qwen_agent import QwenCatanAgent
+from catan_rl.agent.observation import format_catan_observation
 
-from src.catan_rl.agent.observation import format_catan_observation
-from src.catan_rl.agent.prompts import get_system_prompt
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
 
-def generate_grpo_data(
-    num_games: int = 100,
-    output_dir: str = "data/grpo/rollout/",
-    map_type: str = "MINI",
-    vps_to_win: int = 6,
-    opponents: list = None,
-    seed: int = 42,
-):
-    """Generate GRPO rollout data using bot-vs-bot gameplay."""
-    if opponents is None:
-        opponents = ["WeightedRandomPlayer"]
+class GRPODataCollector(Player):
+    """Plays VF-Guard and records ALL (state, actions, vf_scores)."""
 
-    # Map opponent names to classes
-    opponent_registry = {
-        "WeightedRandomPlayer": WeightedRandomPlayer,
-        "VictoryPointPlayer": VictoryPointPlayer,
-        "AlphaBetaPlayer": VictoryPointPlayer,
-        "ValueFunctionPlayer": VictoryPointPlayer,
-    }
+    def __init__(self, color, agent, vf):
+        super().__init__(color)
+        self.agent = agent
+        self.vf = vf
+        self.records = []
+        self.total_decisions = 0
+        self.overrides = 0
 
-    os.makedirs(output_dir, exist_ok=True)
+    def decide(self, game, playable_actions):
+        actions = list(playable_actions)
+        if len(actions) <= 1:
+            self.total_decisions += 1
+            return actions[0] if actions else None
 
-    # Load tokenizer for chat template formatting
-    tokenizer = AutoTokenizer.from_pretrained(
-        '/root/autodl-tmp/Qwen/Qwen3-8B/',
-        trust_remote_code=True,
-    )
+        action_names = {a.action_type.name for a in actions}
+        if action_names == {"ROLL"}:
+            return actions[0]
+        if all(n == "DISCARD_RESOURCE" for n in action_names):
+            return self._heuristic_discard(game, actions)
+        if all(n == "MOVE_ROBBER" for n in action_names):
+            return self._heuristic_robber(game, actions)
 
-    all_records = []
-    games_completed = 0
-    outcomes = {"WIN": 0, "LOSS": 0, "DRAW": 0}
+        self.total_decisions += 1
 
-    logger.info(f"Generating GRPO data: {num_games} games, {map_type} map, {vps_to_win}VP")
-    logger.info(f"Opponents: {opponents}")
-
-    for game_idx in range(num_games):
+        # 1. LLM proposal
         try:
-            # Setup bot players
-            expert = VictoryPointPlayer(Color.BLUE)
-            enemies = []
-            for i, opp_name in enumerate(opponents):
-                color = [Color.RED, Color.WHITE, Color.ORANGE][i]
-                bot_cls = opponent_registry.get(opp_name, WeightedRandomPlayer)
-                enemies.append(bot_cls(color))
+            result = self.agent.act(observation=game.state, valid_actions=actions, player_index=0)
+            llm_idx = result.action_index
+            if not (0 <= llm_idx < len(actions)): llm_idx = 0
+        except Exception:
+            llm_idx = 0
 
-            env = CatanatronEnv(config={
-                "map_type": map_type,
-                "vps_to_win": vps_to_win,
-                "enemies": enemies,
-                "representation": "mixed",
+        # 2. VF scores ALL actions (GRPO: keep all scores)
+        scored = []
+        best_idx, best_score = 0, float('-inf')
+        for i, action in enumerate(actions):
+            try:
+                gc = game.copy(); gc.execute(action)
+                score = self.vf(gc, self.color)
+            except Exception:
+                score = float('-inf')
+            scored.append({"index": i, "score": float(score), "action_name": action.action_type.name})
+            if score > best_score:
+                best_score, best_idx = score, i
+
+        was_override = (best_idx != llm_idx)
+
+        # 3. Record ALL actions (override + 30% sample)
+        if was_override or random.random() < 0.3:
+            obs = format_catan_observation(game.state, actions, 0)
+            self.records.append({
+                "observation": obs,
+                "actions": scored,
+                "best_index": best_idx,
+                "llm_index": llm_idx,
+                "num_actions": len(actions),
+                "was_override": was_override,
+                "best_score": float(best_score),
+                "turn": game.state.num_turns,
             })
 
-            env.reset()
-            done = False
-            game_records = 0
+        return actions[best_idx]
 
-            while not done:
-                state = env.game.state
-                playable = list(state.playable_actions)
-                int_actions = env.get_valid_actions()
+    def _heuristic_discard(self, game, actions):
+        state = game.state; idx = state.colors.index(self.color)
+        resources = {r: state.player_state.get(f"P{idx}_{r}_IN_HAND", 0)
+                     for r in ["WOOD","BRICK","SHEEP","WHEAT","ORE"]}
+        return max(actions, key=lambda a: resources.get(str(a.value), 0))
 
-                if not int_actions:
-                    break
+    def _heuristic_robber(self, game, actions):
+        state = game.state
+        best_vp, best_color = -1, None
+        for i, c in enumerate(state.colors):
+            if c == self.color: continue
+            vp = state.player_state.get(f"P{i}_VICTORY_POINTS", 0)
+            if vp > best_vp: best_vp, best_color = vp, c
+        for a in actions:
+            if a.value and len(a.value) > 1 and a.value[1] == best_color: return a
+        return actions[0]
 
-                # Serialize the game at this decision point
-                game_bytes = pickle.dumps(env.game)
 
-                # Format observation + system prompt
-                obs_text = format_catan_observation(
-                    state, playable, player_index=0, verbose=True
-                )
-                system_prompt = get_system_prompt(version="v1", vps_to_win=vps_to_win)
+def generate_data(num_games=100, opponent="weighted_random", seed=42, output_dir="data/grpo"):
+    random.seed(seed); np.random.seed(seed)
+    os.makedirs(output_dir, exist_ok=True)
 
-                # Build full chat-formatted prompt
-                messages = [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": obs_text},
-                ]
-                full_prompt = tokenizer.apply_chat_template(
-                    messages, tokenize=False, add_generation_prompt=True
-                )
+    logger.info("Loading agent...")
+    agent = QwenCatanAgent.from_pretrained(
+        model_name="/root/autodl-tmp/Qwen/Qwen3-8B/", device="cuda", load_in_4bit=True,
+        lora_path="/root/autodl-tmp/catan-rl-llm/catan-rl-llm/checkpoints/ab_sft/checkpoint-200/",
+        prompt_version="v1")
+    agent.max_new_tokens = 16; agent.temperature = 0.1; agent.do_sample = True
 
-                # Encode data
-                valid_json = json.dumps([str(a) for a in playable])
-                int_json = json.dumps(int_actions)
+    vf = get_value_fn("contender_fn", CONTENDER_WEIGHTS)
+    opponent_class = WeightedRandomPlayer if opponent == "weighted_random" else None
+    colors = [Color.RED, Color.BLUE, Color.WHITE, Color.ORANGE]
 
-                all_records.append({
-                    "prompt": full_prompt,
-                    "serialized_game": base64.b64encode(game_bytes).decode("utf-8"),
-                    "valid_actions": valid_json,
-                    "int_actions": int_json,
-                    "phase": str(state.current_prompt),
-                })
-                game_records += 1
+    all_records = []; t_start = time.time(); total_games = 0; wins = 0
 
-                # Expert bot decides the action and we step
-                expert_action = expert.decide(env.game, playable)
-                action_str = str(expert_action)
-                action_idx = int_actions[0]  # default
-                for i, pa in enumerate(playable):
-                    if str(pa) == action_str and i < len(int_actions):
-                        action_idx = int_actions[i]
-                        break
+    for i in range(num_games):
+        gs = seed + i * 100
+        random.seed(gs); shuffled = list(colors); random.shuffle(shuffled)
+        ac = shuffled[0]
+        collector = GRPODataCollector(ac, agent, vf)
+        opponents = [opponent_class(c) for c in shuffled[1:]]
+        all_players = [collector] + opponents; random.shuffle(all_players)
 
-                obs, reward, terminated, truncated, info = env.step(action_idx)
-                done = terminated or truncated
-
-            # Track outcome
-            winner = env.game.winning_color()
-            if winner is not None:
-                if "BLUE" in str(winner).upper():
-                    outcomes["WIN"] += 1
-                else:
-                    outcomes["LOSS"] += 1
-            else:
-                outcomes["DRAW"] += 1
-
-            env.close()
-            games_completed += 1
-
-            if (game_idx + 1) % 20 == 0:
-                logger.info(
-                    f"  Game {game_idx + 1}/{num_games}: "
-                    f"{len(all_records)} records | "
-                    f"W:{outcomes['WIN']} L:{outcomes['LOSS']} D:{outcomes['DRAW']}"
-                )
-
+        try:
+            game = Game(all_players, vps_to_win=10); winner = game.play()
+            if winner == ac: wins += 1
         except Exception as e:
-            logger.warning(f"Game {game_idx + 1} failed: {e}")
-            continue
+            logger.warning(f"Game {i+1} error: {e}"); continue
 
-    # Save records
-    output_path = os.path.join(output_dir, "rollout.jsonl")
+        total_games += 1; all_records.extend(collector.records)
+
+        if (i + 1) % 10 == 0:
+            elapsed = time.time() - t_start
+            logger.info(f"Game {i+1}/{num_games} | {wins}W/{i+1-wins}L | "
+                       f"{len(all_records)} records | {elapsed:.0f}s")
+
+    output_path = os.path.join(output_dir, "grpo_train_data.jsonl")
     with open(output_path, "w") as f:
-        for r in all_records:
-            f.write(json.dumps(r) + "\n")
+        for rec in all_records: f.write(json.dumps(rec) + "\n")
 
-    logger.info(f"=" * 60)
-    logger.info(f"GRPO data generation complete!")
-    logger.info(f"  Games: {games_completed}")
-    logger.info(f"  Records: {len(all_records)}")
-    logger.info(f"  Outcomes: W:{outcomes['WIN']} L:{outcomes['LOSS']} D:{outcomes['DRAW']}")
-    logger.info(f"  Avg records/game: {len(all_records) / max(games_completed, 1):.0f}")
-    logger.info(f"  Saved to: {output_path}")
-    logger.info(f"=" * 60)
+    total_time = time.time() - t_start
+    overrides = sum(1 for r in all_records if r["was_override"])
+    avg_actions = np.mean([r["num_actions"] for r in all_records])
+    logger.info(f"Done: {total_games} games, {len(all_records)} records, "
+               f"override={overrides/len(all_records)*100:.0f}%, "
+               f"avg_actions={avg_actions:.1f}, time={total_time:.0f}s")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Generate GRPO rollout data")
-    parser.add_argument("--num_games", type=int, default=100, help="Number of games")
-    parser.add_argument("--output", type=str, default="data/grpo/rollout/", help="Output dir")
-    parser.add_argument("--map", type=str, default="MINI", help="Map type")
-    parser.add_argument("--vps", type=int, default=6, help="VPs to win")
-    parser.add_argument("--opponents", type=str, nargs="+", default=["WeightedRandomPlayer"])
-    parser.add_argument("--seed", type=int, default=42)
-    args = parser.parse_args()
-
-    generate_grpo_data(
-        num_games=args.num_games,
-        output_dir=args.output,
-        map_type=args.map,
-        vps_to_win=args.vps,
-        opponents=args.opponents,
-        seed=args.seed,
-    )
-
+    p = argparse.ArgumentParser()
+    p.add_argument("--games", type=int, default=100)
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--output", type=str, default="data/grpo")
+    args = p.parse_args()
+    generate_data(args.games, args.seed, args.output)
 
 if __name__ == "__main__":
     main()
