@@ -20,6 +20,31 @@
 
 ---
 
+## 实验结果一览
+
+下面是四天工作中评估过的所有训练方法与变体，按最终对战胜率降序排列。每个条目的训练数据来源、关键超参、评估局数都标在表里。
+
+| 方法 | 训练数据 | 设置 | 评估 | 对手 | 胜率 |
+|---|---|---|---|---|---|
+| Hybrid Agent（tools + VF） | AB-SFT 加权 (18,945 决策) + 4 个工具调用 | 推理时 VF guardrail | 6 局 | WeightedRandom | 100% (6/6) |
+| VF-Guard | 无训练，AB-SFT 推理 + 推理时 VF 打分 | 推理时打分 | 10 局 | WeightedRandom | 90% (9/10) |
+| Hybrid Agent（tools only） | AB-SFT + 4 工具 | 无 guardrail | 3 局 | WeightedRandom | 66.7% (2/3) |
+| RL-Guard | 30 维特征 + outcome label | 全连接 MLP | 3 局 | WeightedRandom | 67% (2/3)（不稳定） |
+| RL Model Fixed | 72 维特征 + VF 残差 | 全连接 MLP，linear + MSE | 20 局 | WeightedRandom / Random | 44% / 69% |
+| VF-Distill v2 | 439 例 VF 覆盖 LLM 的决策 | LoRA r=16, 2 epochs, LR=1e-4 | 20 局 | WeightedRandom | 40% (8/20) |
+| AB-SFT | 18,945 决策 / 300 局 AlphaBeta 自博弈 | QLoRA r=16 α=32, 3 epochs | 20 局 | Random | 25% (5/20) |
+| GRPO-SFT-All | 1,821 例 VF-best rollout | LoRA, 2 epochs | 5 局 | WeightedRandom | 20% (1/5) |
+| AESL Best-Loss | 同 AB-SFT + entropy 监控 | step=500 | 10 局 | WeightedRandom | 20% (2/10) |
+| Option C Curriculum | outcome label curriculum | 1000 episodes | — | WeightedRandom / Random | 14% / 38% |
+| GRPO-SFT-Filtered | 925 例 high-discrimination | LoRA, 2 epochs | 5 局 | WeightedRandom | 0% (0/5) |
+| GRPO-SFT-Balanced | 725 例 phase-balanced | LoRA, 2 epochs | 5 局 | WeightedRandom | 0% (0/5) |
+| AESL Entropy-Peak | 同 AB-SFT + entropy 监控 | step=150 | 10 局 | WeightedRandom | 0% (0/10) |
+| Hybrid Agent（tools + RL） | AB-SFT + 4 工具 | RL guardrail | 3 局 | WeightedRandom | 0% (0/3) |
+
+注意：除 VF-Guard（10 局）外，所有评估样本都在 20 局以下。6/6、9/10、8/20 这类数字在统计上与基线难以显著区分。30 局以上的复现评估列入下一步。
+
+---
+
 ## 研究问题
 
 下面六个问题驱动了项目的主要工作。每一节给出动机、做法与结果。
