@@ -1,196 +1,244 @@
 # catan-rl-llm
 
-> 训练 Qwen3-8B 玩《卡坦岛》（Settlers of Catan）的完整实验仓库。
+训练语言模型玩《卡坦岛》（Settlers of Catan）的实验仓库。本仓库围绕 catanatron 引擎与 Qwen3-8B 基座，探索 SFT、蒸馏、RL、工具调用与 guardrail 在多人不完美信息博弈中的相对有效性。
+
+完整实验档案（含决策依据、失败教训、组件设计、推荐协议）见 [`PROJECT_SUMMARY.md`](./PROJECT_SUMMARY.md)。本文面向想快速理解「这个项目在研究什么、做了什么、得到了什么」的人。
 
 ---
 
-## 1. 一句话状态
+## 当前进度
 
-**当前最强方案：Hybrid Agent（工具 + VF guardrail）= 100% (6/6) 胜率 vs WeightedRandom**。完整实验历程、失败教训、决策依据见 [`PROJECT_SUMMARY.md`](./PROJECT_SUMMARY.md)。
+工作自 2026-08-06 开始，至 2026-08-10 共四天。期间共实施 10 种方法、3 次模型修复、1 次系统消融。结论按强度排序如下：
 
-| 方案 | 胜率 | guardrail | 备注 |
-|---|---|---|---|
-| **Hybrid Agent（tools + VF）** | **100% (6/6)** | VF | 当前最强 |
-| Hybrid Agent（tools only） | 66.7% (2/3) | 无 | 工具够战略，缺战术精修 |
-| VF-Distill v2（独立模型） | 40% (8/20) | 无 | 文本观察不够 |
-| AB-SFT（纯模仿） | 25% (5/20) | 无 | 模仿只学格式不学策略 |
-| RL-Guard（RL 模型打分） | 0–67% 不稳定 | RL | RL 模型预测 outcome 不预测 action 质量 |
-| Hybrid Agent（tools + RL guard） | 0% (0/3) | RL | RL guard 是有害的 |
+- Hybrid Agent（工具 + 价值函数 guardrail）在一组 6 局评估中取得对 WeightedRandom 的 6/6 胜率，局长约 90 回合。这一结果未在更大样本上复现。
+- VF-Guard（LLM + 手写价值函数，无工具）在一组 10 局评估中取得 9/10 胜率，作为本项目的「实用上限」基准。
+- 纯模仿（SFT）训练收敛（loss 0.04、token 准确率 99%）但胜率与随机基线无差异（25%）。
+- 任何依赖「游戏最终胜负」作为训练信号的 RL 方法（GRPO、outcome label 课程）胜率均低于或接近随机基线。
+- 30 维特征的轻量 RL 模型用作动作打分时表现不稳定（0% – 67%），替换为 72 维特征 + 价值函数残差训练后稳定到 44%（vs WeightedRandom）。
+
+这些数字的样本量都偏小（3–20 局/配置），区分方法优劣时需保留显著性的怀疑。30 局以上的复现评估列入下一步。
 
 ---
 
-## 2. 项目目标
+## 研究问题
 
-以 Qwen3-8B 为基座、围绕 catanatron-gym 引擎，研究 SFT / RL / 蒸馏 / 工具调用 / Guardrail 等不同训练范式在多人博弈场景下的有效性。
+本项目围绕以下五个相互关联的问题展开。每一节给出研究动机、采用的方法和主要发现。
 
-最终目标层级：
+### RQ1：纯模仿学习能否让 LLM 学会玩卡坦？
 
-| 层级 | 描述 | 当前状态 |
+**动机**：卡坦是部分可观测的多人博弈，决策依赖对手建模与长程规划。监督微调在很多领域有效，但在博弈中可能只学到「合法动作」而学不到「好动作」。
+
+**方法**：用 catanatron 内置的 VictoryPointPlayer（最强内置 bot）生成 300 局共 18502 条决策，训练 Qwen3-8B 的 LoRA 适配器（r=16，α=32），3 个 epoch。
+
+**结果**：训练收敛（最终 loss 0.089，token 准确率 99%）。评估 20 局，胜率 5/20 = 25%，与 WeightedRandom 在 4 人局中的随机基线齐平。模型合法动作率 100%，但战略层面无可见提升。
+
+**结论**：纯模仿在卡坦上仅学到「格式正确」，不能学到「策略有效」。这是 RQ2 开始的动机。
+
+### RQ2：是否需要强化学习？
+
+**动机**：SFT 失败的常见解释是模仿只复制表面、不内化决策逻辑。GRPO 是当前 LLM RL 的主流方法之一。
+
+**方法**：基于 SFT LoRA 启动 GRPO 训练，使用游戏终局胜负作为奖励，4 人局对战 WeightedRandom。
+
+**结果**：训练过程出现两类持续性问题。一是 KL 散度几乎为零、奖励在 −1 到 −0.4 间震荡，模型未发生有效策略更新；二是在更高温度（1.0 以上）下模型输出中文幻觉文本（已通过温度上限与超长输出惩罚缓解）。即使在基础设施正常的情况下，单纯把胜负作为奖励信号在本任务上未见明显改善。
+
+**结论**：用胜负作为 RL 奖励在本任务上不奏效，这与 RQ5 中的 outcome label 失败是同一现象的不同侧面。
+
+### RQ3：手写价值函数能否替代 RL？
+
+**动机**：卡坦已有一个成熟的价值函数（catanatron 仓库中的 `contender_fn`，13 个特征的线性加权）。它能在单人前瞻搜索下达到接近上限的表现。如果它本身已经够好，RL 的目标应该是「让 LLM 学会它」，而不是「绕开它」。
+
+**方法**：VF-Guard = LLM 输出动作类型 + `contender_fn` 对所有合法动作打分，挑选最高分。LLM 的提议在约半数非平凡决策中被覆盖，绝大多数是「同类型内的具体位置」（哪条边、哪个节点）。
+
+**结果**：4 人局对 WeightedRandom，10 局中胜 9 局。这一表现与纯 `contender_fn` 在 3 人局上的 90% 胜率相当，意味着组合 LLM 的战略意图与价值函数的战术打分已经接近天花板。
+
+**意义**：VF-Guard 给出了本项目的实用上限——任何纯 LLM 方案若想突破它，需要的不是更聪明的算法，而是文本观察无法承载的空间信息。这把研究问题从「如何训练 LLM」转向「如何把价值函数桥接到 LLM 上」。
+
+### RQ4：LLM 能否学会价值函数的偏好？
+
+**动机**：VF-Guard 每步都要做一次价值函数打分（约 50% 的非平凡决策被覆盖）。如果能把这些覆盖模式蒸馏进 LLM，推理时就不必每次都调用价值函数。
+
+**方法**：从 VF-Guard 100 局游戏中收集 1022 条决策，其中 439 条是 VF 覆盖 LLM 的情况。从 SFT LoRA 续训，学习率 1e-4，2 个 epoch。
+
+**结果**：训练收敛（loss 0.073，准确率 97.6%）。评估 20 局，胜率 8/20 = 40%，比 SFT（25%）高，比 VF-Guard（90%）低 50 个百分点。
+
+**分析**：20 局的差距集中于「同类型内的位置选择」。文本观察把候选位置编码成「可建节点列表第 N 项」，无法承载几何相邻关系，LLM 在这种细粒度区分上始终输给显式计算。RQ5 转向另一条路：让 LLM 直接访问工具而非内化工具的偏好。
+
+### RQ5：工具调用是否能补足文本观察的盲区？
+
+**动机**：SFT 学到战略、价值函数补足战术——但 SFT 是与价值函数分离的两段式拼接。如果让 LLM 在决策前看到价值函数的输出（以工具结果形式），战略和战术是否能在 LLM 内部被更自然地结合？
+
+**方法**：Hybrid Agent 在 LLM 决策之前调用四个工具（`analyze_position` 评估胜率与产能、`check_threats` 评估对手威胁、`get_best_move` 给定目标下的候选动作、`simulate_outcome` 单步推演），将结果附加到观察文本。LLM 输出动作类型，最后仍由价值函数做最终 guardrail（即覆盖 LLM 决策）。
+
+**结果**：消融三组：
+
+| 配置 | 胜率 | 样本 |
 |---|---|---|
-| L0 | 正确格式输出合法动作（≥ 95%） | ✅ 100% |
-| L1 | 击败 WeightedRandom 基线（4 人局 > 25%） | ✅ 最高 100% |
-| L2 | 击败 VictoryPointPlayer（最强内置） | ❌ 未达成 |
-| L3 | 强到可以作为研究对象 | ❌ 未达成 |
+| 工具 + 价值函数 guard | 6/6 | 6 局 |
+| 工具 + RL 模型 guard | 0/3 | 3 局 |
+| 仅工具，无 guard | 2/3 | 3 局 |
+
+工具本身已把胜率从 25% 提升到约 67%，价值函数 guardrail 进一步把 67% 推到 100%。RL 模型作为 guard 时胜率反而降到 0%，原因是 RL 模型训练目标是「预测游戏终局胜负」而非「评估动作质量」，30 维特征下 47% 的决策输出完全相同的分数（详见 RQ6）。
+
+**结论**：在卡坦这种文本难以编码空间信息的任务上，把外部计算以工具结果形式注入 LLM 比让 LLM 内化价值函数更直接。RL guard 的失败提示：不是所有能打分的模型都适合作为战术裁判。
+
+### RQ6：RL 模型本身的失败是特征不够还是训练目标不对？
+
+**动机**：30 维特征的 RL 模型在 Hybrid Agent 中不仅无用而且有害。一个候选解释是特征不足（同类动作的特征向量完全相同），另一个是训练目标（预测胜负）与使用方式（评分动作）不匹配。
+
+**方法**：两件事并行做。
+
+一是把特征从 30 维扩到 72 维，加入 per-resource 产能、对手明细、港口访问、建造能力标志等「会随具体动作变化」的特征。
+
+二是把训练目标从「预测胜负（sigmoid + BCE）」改为「预测价值函数残差」（线性输出 + MSE，标签 = `(VF − VP·3e14) / 1e8`，范围约 [−1, 2]）。价值函数残差关注「同一胜局水平下，质量差异在哪里」。
+
+**结果**：在 AlphaBeta 数据上训练 500 步后，对 Random 胜率 69%（原 25%），对 WeightedRandom 胜率 44%（原 0% – 25%），同类动作间的分数方差（action spread）从约 0.018 升到 0.064，flat 决策比例从 47% 降到 3.1%。
+
+**结论**：在本任务上，特征工程的收益（15 倍 flat 决策下降）远大于算法层面的改动。但即使是修复后的模型，在「同类型内位置选择」上仍不能区分（比如所有修路动作的特征几乎一致），最终仍需价值函数 guardrail 兜底。
 
 ---
 
-## 3. 时间线（短版）
+## 一些跨方法的观察
 
-每个方法 3–5 行要点；完整论证见 [`PROJECT_SUMMARY.md`](./PROJECT_SUMMARY.md) 第 2 章。
+下面五条观察来自多次失败后的总结，不是单次实验的结果。
 
-| # | 方法 | 日期 | 关键结果 |
-|---|---|---|---|
-| 1 | AB-SFT（纯模仿） | 2026-08-07 | loss 0.044、token acc 98%、WR **25%**（基线齐平） |
-| 2 | VF-Guard（发现） | 2026-08-07 | LLM + 手写 VF 打分，WR **90%**（9/10） |
-| 3 | VF-Distill v2 | 2026-08-07 | override-only 蒸馏，WR **40%**（8/20） |
-| 4 | RL-Guard | 2026-08-07 | 30 特征 RL 模型打分，WR **0–67%** 不稳定 |
-| 5 | Hybrid Agent v1 | 2026-08-07 | 工具 + VF，WR **100%** (3/3) |
-| 6 | GRPO / VF rollout | 2026-08-08 | 三组数据全失败，WR **0–20%** |
-| 7 | AESL entropy 早停 | 2026-08-08 | 假说被拒绝，峰值点 **0%** WR |
-| 8 | RL 模型修复 | 2026-08-08 | 30→72 特征 + VF 残差，WR **44% vs WeightedRandom** |
-| 9 | Hybrid Agent 消融 | 2026-08-08 | tools+VF 100%、tools+RL 0%、tools only 66.7% |
-| 10 | Option C 课程 | 2026-08-08 | outcome label 噪声，WR **12–38%** |
+**1. 4 人博弈的胜负是噪声标签。** 4 人局中 75% 的状态来自输家。输家可能打得很差也可能打得很好但牌运差。把胜负当 state quality 训练，会让模型学到「平均胜率 25% + 高置信度」，对动作选择没有帮助。这一点在 Option C 课程实验中表现最明显：训练指标漂亮（相关系数 0.83、flat 决策 0%），实际胜率 14%。
+
+**2. 价值函数残差是好训练信号，胜负不是。** 残差范围 [−1, 2]、线性输出、干净梯度，是「同胜局水平下状态质量的连续度量」。它直接来自现在这个状态，不依赖未来 100 步的随机性。
+
+**3. 价值函数是好的裁判、坏的教师。** 作为推理时的最终裁判，VF-Guard 和 Hybrid Agent 都能稳定接近上限。作为训练数据的来源（直接蒸馏 VF 的覆盖决策、或把 VF 评分当作标签），所有方案都在 0% – 40%。原因是 VF 在不同状态下的「最优动作」之间没有一致的策略语境。
+
+**4. 给模型看得见的特征比给它更聪明的算法更重要。** 30 维特征升到 72 维，flat 决策下降 15 倍。这比同时间内任何 RL 算法改进都大。
+
+**5. 训练指标会骗人。** loss、token 准确率、价值函数相关系数、动作方差，这些指标都可能与对战胜率脱钩。唯一可信的指标是对战胜率本身，且需要在多局、对多对手的条件下取平均。
 
 ---
 
-## 4. 快速上手
+## 复现
 
-### 4.1 环境
+环境：Python ≥ 3.10，PyTorch ≥ 2.1，NVIDIA RTX 4090 D 24GB（AutoDL 容器）。
 
 ```bash
-# 硬件：NVIDIA RTX 4090 D 24GB（AutoDL 容器）
-# Python ≥ 3.10，PyTorch ≥ 2.1
-cd catan-rl-llm
 pip install -r requirements.txt
-# 或 poetry / pip install -e .
 ```
 
 主要依赖：`torch`、`transformers`、`trl`、`peft`、`catanatron-gym`、`gymnasium`、`vllm`。
 
-### 4.2 数据生成
+数据生成：
 
 ```bash
-# 第一次 SFT 数据（VictoryPointPlayer × WeightedRandom 100 局）
+# SFT 数据（VictoryPointPlayer × WeightedRandom 100 局，~18.5K 决策）
 python scripts/generate_sft_data.py --num_games 100 --output data/sft/ --seed 42
 
-# AB-SFT 数据（VictoryPointPlayer × WeightedRandom 300 局，更大规模）
+# AB-SFT 数据（300 局，更大规模）
 python scripts/generate_ab_sft_data.py --num_games 300 --output data/ab_sft/
 
 # VF 蒸馏数据（VF-Guard 覆盖 LLM 的决策）
 python scripts/generate_vf_distill_data_v2.py
-
-# GRPO rollout 数据（bot-vs-bot）
-python scripts/generate_grpo_data.py --num_games 100 --output data/grpo/iter1/
 ```
 
-### 4.3 训练
+训练：
 
 ```bash
-# SFT（从 Qwen3-8B 基座）
-python scripts/train_sft.py \
-    --data data/sft/ \
-    --output checkpoints/sft/
-
 # AB-SFT
-python scripts/train_sft_best.py \
-    --data data/ab_sft/ \
-    --output checkpoints/ab_sft/
+python scripts/train_sft_best.py --data data/ab_sft/ --output checkpoints/ab_sft/
 
-# VF 蒸馏
+# VF 蒸馏 v2
 python scripts/train_vf_distill_v2.py
 
 # AESL entropy 监控训练
 python scripts/train_aesl.py
 
-# 价值网络（30 特征旧版 / 72 特征 VF 残差版）
+# 价值网络（72 维 VF 残差版本）
 python scripts/train_value_network.py
 ```
 
-### 4.4 评估
+评估：
 
 ```bash
-# AB-SFT 模型
+# AB-SFT
 python scripts/eval_ab_sft.py --model checkpoints/ab_sft/checkpoint-200/
 
-# VF-Guard
+# VF-Guard（实用上限基准）
 python scripts/eval_vf_guard.py --games 10
 
 # RL-Guard
 python scripts/eval_rl_guard.py --games 10
 
-# Hybrid Agent（最强方案）
+# Hybrid Agent（消融与最终评估）
+python scripts/eval_hybrid_ablation.py
 python scripts/eval_agent_hybrid.py --games 6
 
-# Hybrid Agent 消融（3 配置）
-python scripts/eval_hybrid_ablation.py
-
-# 最终统一评估
+# 统一最终评估
 python scripts/run_final_eval.py
 ```
 
 ---
 
-## 5. 项目结构
+## 仓库结构
 
 ```
 catan-rl-llm/
-├── README.md              # 本文件（用法 + 当前最强方案）
-├── PROJECT_SUMMARY.md     # 完整实验档案（决策依据 + 失败教训）
+├── README.md              # 本文件
+├── PROJECT_SUMMARY.md     # 完整实验档案（决策依据、失败教训、组件设计、推荐协议）
 ├── pyproject.toml
 ├── requirements.txt
-├── .env                   # HF_TOKEN / WANDB_API_KEY 占位
-│
-├── configs/               # YAML：default / sft / grpo / eval
+├── configs/               # YAML 配置：default / sft / grpo / eval
 ├── src/catan_rl/          # 代码包
-│   ├── agent/             # LlamaGym Agent 基类 + Qwen 实现 + 观察/解析/提示
+│   ├── agent/             # LlamaGym Agent 基类、Qwen 实现、观察格式化、动作解析
 │   ├── env/               # Catanatron 适配、状态序列化、奖励、模拟器
-│   ├── rl/                # 特征工程、值网络（30/72 维）、minimax
-│   ├── data/              # SFT / GRPO 数据集定义、rollout
+│   ├── rl/                # 特征工程、值网络、minimax
+│   ├── data/              # 数据集定义与 rollout
 │   ├── training/          # 训练入口
 │   └── eval/              # 对战 arena、指标、可视化
-│
-├── scripts/               # 30+ 命令行入口（数据生成 / 训练 / 评估）
-├── data/                  # 11 类训练数据子目录
-├── checkpoints/           # 14 个模型/目录
-├── experiments/           # 4 份阶段性搭建文档
-├── notebooks/             # 11 份实验结果（按时间编号）
-└── results/               # 最终评估 JSON、arena 复盘、plots
+├── scripts/               # 30+ 命令行入口
+├── data/                  # 训练数据（11 个子目录，按方法分）
+├── checkpoints/           # 模型权重（14 个目录）
+├── experiments/           # 阶段搭建文档
+├── notebooks/             # 实验结果（按日期与方法编号）
+└── results/               # 最终评估数据与可视化
 ```
 
 ---
 
-## 6. 实验文档索引
+## 文档索引
 
-| 文档 | 用途 |
-|---|---|
-| [**PROJECT_SUMMARY.md**](./PROJECT_SUMMARY.md) | **完整实验档案**（决策记录 + 失败教训 + 9 章详解）。从「为什么这个方法」到「下一步做什么」都在这里。 |
-| [`notebooks/00-original-log-2026-08-06.md`](./notebooks/00-original-log-2026-08-06.md) | 原始实验日志：环境搭建、SFT、GRPO 试训 |
-| [`notebooks/01-session-2026-08-08.md`](./notebooks/01-session-2026-08-08.md) | 8 月 8 日全天 session：VF-Guard、RL 修复、Hybrid Agent 评估、Option C |
-| [`notebooks/ab-sft-results.md`](./notebooks/ab-sft-results.md) | AB-SFT 25% WR；纯模仿不够 |
-| [`notebooks/vf-guard-discovery.md`](./notebooks/vf-guard-discovery.md) | VF-Guard 90% WR；转折点 |
-| [`notebooks/option-a-v2-results.md`](./notebooks/option-a-v2-results.md) | VF 蒸馏 v2 40% WR；三处修复 |
-| [`notebooks/rl-guard-results.md`](./notebooks/rl-guard-results.md) | RL-Guard 0–67% 不稳定 |
-| [`notebooks/hybrid-agent-results.md`](./notebooks/hybrid-agent-results.md) | Hybrid Agent v1 100% (3/3) WR |
-| [`notebooks/grpo-results.md`](./notebooks/grpo-results.md) | GRPO / VF rollout 0–20% WR |
-| [`notebooks/aesl-experiment-results.md`](./notebooks/aesl-experiment-results.md) | AESL entropy 假说被拒绝 |
-| [`notebooks/rl-model-fixed.md`](./notebooks/rl-model-fixed.md) | RL 模型修复：72 特征 + VF 残差 |
-| [`notebooks/option-c-curriculum-results.md`](./notebooks/option-c-curriculum-results.md) | Option C 课程 12–38% WR |
-| [`notebooks/final-results-2026-08-08.md`](./notebooks/final-results-2026-08-08.md) | 完整管线结果 + Hybrid Agent 消融 |
-| [`notebooks/MEMORY.md`](./notebooks/MEMORY.md) | 实验结果导航索引 |
-| [`experiments/01_phase1_setup.md`](./experiments/01_phase1_setup.md) | 阶段一：环境搭建 |
-| [`experiments/02_phase2_agent.md`](./experiments/02_phase2_agent.md) | 阶段二：Agent 实现 |
-| [`experiments/03_phase3_sft.md`](./experiments/03_phase3_sft.md) | 阶段三：SFT 训练 |
-| [`experiments/04_phase4_rl.md`](./experiments/04_phase4_rl.md) | 阶段四：GRPO 基础设施 |
+### 实验结果（按时间排序）
+
+- [`notebooks/00-original-log-2026-08-06.md`](./notebooks/00-original-log-2026-08-06.md)：原始实验日志，含环境搭建、SFT、GRPO 试训全过程
+- [`notebooks/ab-sft-results.md`](./notebooks/ab-sft-results.md)：RQ1，纯模仿 25% 胜率
+- [`notebooks/vf-guard-discovery.md`](./notebooks/vf-guard-discovery.md)：RQ3，VF-Guard 9/10
+- [`notebooks/option-a-v2-results.md`](./notebooks/option-a-v2-results.md)：RQ4，VF 蒸馏 40% 胜率
+- [`notebooks/rl-guard-results.md`](./notebooks/rl-guard-results.md)：RL-Guard 不稳定
+- [`notebooks/hybrid-agent-results.md`](./notebooks/hybrid-agent-results.md)：RQ5 初版 100% (3/3)
+- [`notebooks/01-session-2026-08-08.md`](./notebooks/01-session-2026-08-08.md)：8 月 8 日全天 session 记录
+- [`notebooks/grpo-results.md`](./notebooks/grpo-results.md)：RQ2，GRPO/VF rollout 失败
+- [`notebooks/aesl-experiment-results.md`](./notebooks/aesl-experiment-results.md)：entropy 早停假说被拒
+- [`notebooks/rl-model-fixed.md`](./notebooks/rl-model-fixed.md)：RQ6，72 特征 + VF 残差
+- [`notebooks/option-c-curriculum-results.md`](./notebooks/option-c-curriculum-results.md)：outcome label 课程 12–38%
+- [`notebooks/final-results-2026-08-08.md`](./notebooks/final-results-2026-08-08.md)：Hybrid Agent 消融与最终评估
+- [`notebooks/MEMORY.md`](./notebooks/MEMORY.md)：实验结果导航
+
+### 阶段搭建文档
+
+- [`experiments/01_phase1_setup.md`](./experiments/01_phase1_setup.md)：环境与依赖
+- [`experiments/02_phase2_agent.md`](./experiments/02_phase2_agent.md)：Agent 实现
+- [`experiments/03_phase3_sft.md`](./experiments/03_phase3_sft.md)：第一次 SFT
+- [`experiments/04_phase4_rl.md`](./experiments/04_phase4_rl.md)：GRPO 基础设施
+
+### 综合档案
+
+- [`PROJECT_SUMMARY.md`](./PROJECT_SUMMARY.md)：完整实验档案。九个章节覆盖背景、时间线、七个失败路径、获胜方案、关键组件、五条核心洞察、推荐评估协议、下一步与引用索引。
 
 ---
 
-## 7. 写作风格与文档维护约定
+## 局限与下一步
 
-- 中文为主，专有名词与代码标识符保留英文。
-- 陈述句为主，不用「令人」「不仅」「更重要的是」这类修饰词堆砌。
-- 每个结论后跟证据（实验 notebook 链接或文件路径）。
-- 新方法完成后同步更新 `PROJECT_SUMMARY.md` 的 §2、§3、§6。
-- 新增 notebook 时同步更新 `PROJECT_SUMMARY.md` 的 §9.3 与本文件的 §6。
+样本量是最显眼的局限。Hybrid Agent 的 100% (6/6) 与 VF-Guard 的 9/10 都不能区分「方法真的有效」与「恰好赢了几局」。30 局以上的复现评估、对 VictoryPointPlayer 的对比、以及把 100% 的声明建立在更大样本上是优先级最高的下一步。
+
+其他列入下一步的事项：修复 72 维 RL 模型在修路动作上的盲区；把端到端 Qwen 推理替换掉 Ollama 中间层（已发现可节省约 50% 推理延迟）；修复 Option C 课程中已发现的公式 bug 并重跑 VF 残差版本。
+
+详细的下一步列表与推荐评估协议见 [`PROJECT_SUMMARY.md`](./PROJECT_SUMMARY.md) 第 7、8 章。
 
 ---
 
