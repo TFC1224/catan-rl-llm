@@ -470,7 +470,7 @@ catan-rl-llm/
 | 3 | **VF-SFT 平衡数据 v2**（`generate_vf_sft_data_v2.py`） | 当前 53% index-0 trivial actions | 80-85% | 1 天 |
 | 4 | **扩 VF-SFT 数据到 600+ 局** | 进一步量变到质变 | 80-85% | 1 天 |
 
-VF-SFT 是当前唯一已被规模化验证（50 局 76%）的 standalone Qwen 路径。优先做这 4 项是数据驱动的——ESCU 论文改进方案已在单独评估文件中被否定（Shapley Value 在 72 特征上仍是状态质量信号，不解决根本瓶颈）。
+VF-SFT 是当前唯一已被规模化验证（50 局 76%）的 standalone Qwen 路径。
 
 其他待办：Hybrid Agent 扩到 100 局；修复 72 维 RL 模型在修路动作上的盲区；把端到端 Qwen 推理替换掉 Ollama 中间层（已发现可节省约 50% 推理延迟）；Hybrid Agent vs VictoryPointPlayer 30 局（跨过 L2 目标）。
 
@@ -478,4 +478,4 @@ VF-SFT 是当前唯一已被规模化验证（50 局 76%）的 standalone Qwen �
 
 ---
 
-*最后更新：2026-08-10（VF-SFT 50 局 76% 复现、Qwen checkpoint mass eval、ESCU 改进方案评估已完成）*
+*最后更新：2026-08-10（VF-SFT 50 局 76% 复现、Qwen checkpoint mass eval 已完成）*
