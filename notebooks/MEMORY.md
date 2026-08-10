@@ -1,0 +1,10 @@
+- [AlphaBeta SFT Results](ab-sft-results.md) — SFT converges (loss 0.044, acc 98%) but only achieves 25% win rate (random baseline); imitation learning insufficient for strategy
+- [VF-Guard Discovery](vf-guard-discovery.md) — LLM+VF achieves 90% win rate; GRPO unnecessary; path forward is distillation (Option A→E→B→C)
+- [Option A v2 Results](option-a-v2-results.md) — VF Distillation v2 achieves 40% WR (3 fixes: override-only, AB-SFT init, LR=1e-4)
+- [RL-Guard Results](rl-guard-results.md) — RL model for action scoring is actively harmful (0-67% WR, unstable); predicts outcomes not action quality
+- [Hybrid Agent Results](hybrid-agent-results.md) — Enriched observations + VF guardrail achieves 100% WR (6/6); first method to match VF-Guard
+- [Final Results 2026-08-08](final-results-2026-08-08.md) — Complete pipeline results; Hybrid Agent is the winning architecture; RL model needs fixing
+- [GRPO Results](grpo-results.md) — GRPO experiment: VF-scored rollout data harmful for training (0-20% WR vs 25% baseline)
+- [AESL Experiment Results](aesl-experiment-results.md) — AESL diversity early-stopping REJECTED; entropy-peak (0% WR) worse than best-loss (20% WR)
+- [RL Model Fixed](rl-model-fixed.md) — RL model FIXED with 72 enriched features + VF residual; 69% WR vs Random, 44% vs WeightedRandom, 3.1% flat (was 47%)
+- [Option C Curriculum Results](option-c-curriculum-results.md) — Outcome-based curriculum REJECTED (12-38% WR); outcome labels fundamentally noisy for 4P Catan; VF residual labels needed
