@@ -139,6 +139,157 @@
 
 ---
 
+## 实验细节
+
+下面对每个方法给出**做法**（数据规模、超参、推理时结构）、**结果**（胜率与样本量）、**失败原因**（若适用）。这一节是 RQ1–RQ6 与实验结果一览表的展开版。
+
+### Hybrid Agent（tools + VF guardrail）— 100% (6/6)
+
+**做法**：在 LLM 决策前调用四个工具，把结果追加到观察文本：
+
+- `analyze_position` — RL 模型 (`rl_enriched_model.pt`) 输出当前胜率与产能评级
+- `check_threats` — 扫描对手，输出每个对手的 VP、紧急度（≥8 VP / ≥6 VP）
+- `get_best_move` — 给定目标（如「扩展最长道路」「建城市」）用 RL 模型给所有合法动作打分
+- `simulate_outcome` — 单步推演候选动作的预期效果
+
+LLM 仍输出 `{"action_number": N}`（无需重训，AB-SFT 权重直接复用）。最后由 `contender_fn` 给所有合法动作打分，挑最高分作为最终动作。
+
+**结果**：6 局全胜。局长 57–127 回合，明显短于 RL-Guard 的 172–262 回合。胜率与 VF-Guard 同档（90%），但路由更长。
+
+**消融**：去掉 VF guardrail 留 4 工具 → 2/3（66.7%）；去掉工具保留 VF guardrail 退化为 VF-Guard（90%）。两边都贡献正向收益，guardrail 贡献更大。
+
+### VF-Guard（LLM + 手写 VF）— 90% (9/10)
+
+**做法**：AB-SFT 权重不动，推理时做三件事：LLM 输出一个动作提议；`contender_fn`（catanatron 内置的 13 特征线性价值函数）对所有合法动作打分；如果 VF 的最高分动作不是 LLM 提议的动作，就覆盖。整局每步约 2 分钟（其中 LLM 调用是瓶颈）。
+
+**结果**：10 局中胜 9 局。约 50% 的非平凡决策被 VF 覆盖，绝大多数是「同类型内的位置选择」（哪条边、哪个节点），LLM 负责动作类型选择、VF 负责位置精细化。
+
+**意义**：这是本项目的实用上限。要想突破它，必须让 LLM 拿到文本观察无法承载的空间信息——这正是 RQ5（Hybrid Agent）的动机。
+
+### RL Model Fixed（72 维特征 + VF 残差）— 44% vs WeightedRandom / 69% vs Random
+
+**做法**：
+
+特征从 30 维扩到 72 维，新增以下几类：
+
+- 产能 per-resource（5 维）：随具体动作（强盗位置、定居点位置）变化
+- 强盗上下文（3 维）：强盗所在玩家与地块值
+- 港口访问（4 维）：当前拥有港口类型
+- 对手明细（每个对手 18 维 ×3 = 54 维中的核心）：VP、knight 数、城市数、产能
+- 强盗资源 one-hot（5 维）
+- 路/扩展（4 维）：拥有地块数、平均产能
+- 可建造标志（4 维）：city / settlement / road / dev card 是否可建
+- 牌手距离（1 维）：到下一个城市/定居点完成距离
+
+训练目标从「预测胜负（sigmoid + BCE）」改为「预测 VF 残差」：
+
+```
+label = (VF - VP * 3e14) / 1e8   # 范围 [-1, 2]
+loss  = MSE, output linear (no sigmoid)
+```
+
+直接预测 VF 会被 VP 项淹没（6 个数量级），残差关注的是「同胜局水平下质量差异」。
+
+数据：300 局 AlphaBeta 自博弈 ~100K 样本；网络 `[256, 128, 64]` 全连接；500 步训练。
+
+**结果**：对 Random 胜率 25% → 69%；对 WeightedRandom 胜率 0–25% → 44%；action spread 0.018 → 0.064；flat 决策 47% → 3.1%。
+
+**残留盲区**：所有 BUILD_ROAD 动作的特征向量仍然几乎一致（`roads_placed` 与 `my_road_len` 同），模型在修路决策上仍输出相同分数，需要 VF guardrail 兜底。
+
+### VF-Distill v2（蒸馏 VF-Guard 覆盖决策）— 40% (8/20)
+
+**做法**：跑 100 局 VF-Guard 游戏，记录 LLM 每步的提议与 VF 是否覆盖。1022 条决策里，VF 覆盖 LLM 的有 439 条。从 AB-SFT LoRA 续训（不重头），仅在这 439 条覆盖决策上 SFT：LoRA r=16，2 epochs，batch_size=16，LR=1e-4（比 AB-SFT 的 2e-4 小），max_length=1024。训练 9.5 分钟。
+
+**结果**：loss 0.073，token 准确率 97.6%。8/20 胜率（40%），比 AB-SFT（25%）高 15 个百分点，比 VF-Guard（90%）低 50 个百分点。
+
+**失败原因**：20 局的差距集中在「同类型内的位置选择」。文本观察把候选位置编码成「可建节点列表第 N 项」，无法承载几何相邻关系——LLM 在这种细粒度区分上始终输给显式计算。
+
+**v1 → v2 的三处修复**：v1 仅 20% 胜率（2/10），原因是同时跑全 1022 条数据（覆盖 + 未覆盖混训）、从 base Qwen 启动（不续 AB-SFT）、LR=2e-4。三个一起改才到 40%。
+
+### RL-Guard（30 维 RL 模型作 guardrail）— 67% (2/3) / 0% (3/3)
+
+**做法**：用 `rl_selfplay_model2.pt`（30 维特征，sigmoid + BCELoss 训练，outcome label）替代 VF-Guard 中的 `contender_fn`，给所有合法动作打分。
+
+**结果**：原始 3 局评估 2/3 (67%)；Hybrid 消融中重测 0/3。
+
+**失败原因**：
+
+- 30 维特征对同类动作（修路、强盗移动）输出几乎相同的分数——47% 的决策 flat（spread < 0.001）
+- 训练目标是「预测胜负」，而不是「评估动作质量」——「正确动作」不一定是「胜局」，4 人局中 ~75% 状态来自输家
+- 模型学会「平均 25% 胜率 + 高置信度」，对动作选择无帮助
+
+后续 72 特征 + VF 残差的 `rl_enriched_model.pt` 即为对此失败模式的修复（见上）。
+
+### AB-SFT（纯模仿）— 25% (5/20)
+
+**做法**：用 AlphaBetaPlayer（DarekYu fork，catanatron 内置最强 bot）生成 300 局自博弈 18,945 条决策，98% AB 胜率。Qwen3-8B + QLoRA（r=16, α=32），3 epochs。推理时直接用训练好的 LoRA，每步采样温度 0.1。
+
+**结果**：训练收敛，loss 1.627 → 0.044，token 准确率 68% → 98%。评估 20 局对 RandomPlayer，胜率 5/20 = 25%，与 4 人局加权随机基线齐平。合法动作率 100%。
+
+**失败原因**：模仿学习只能复制「合法动作到动作序号」的表面映射，不能内化 AlphaBeta 选择该动作的几何/博弈理由。面对训练集外的棋盘布局与对手策略，映射就崩了。
+
+### GRPO / VF-rollout SFT（3 组）— 0% – 20%
+
+**做法**：把 GRPO 思路简化为「用 VF 在 rollouts 上打分的最佳动作作为 SFT 数据」，做三个过滤版本：
+
+- GRPO-SFT-All：1,821 例 VF-best（所有 rollout）
+- GRPO-SFT-Filtered：925 例 VF-best 且 VF 分数高离散度（hard examples）
+- GRPO-SFT-Balanced：725 例 VF-best 且阶段均衡
+
+都从 AB-SFT 续训，2 epochs。原始 GRPO 完整实现（带 KL 与策略梯度）也曾试，loss 在 1.0 附近不下降。
+
+**结果**：All 1/5 (20%)；Filtered 0/5 (0%)；Balanced 0/5 (0%)。
+
+**失败原因**：
+
+1. VF 在任意状态上的「最优动作」不形成连贯策略。同类动作在不同上下文里可能被 VF 标「最优」也可能不被，模型学不到一致模式。
+2. 数据量增加 4 倍反而更差（1,821 例 → 20% vs 439 例 → 40%），说明质量比数量重要。
+3. 过滤让结果更差：high-discrimination 子集是 VF 分数差异最显著的 hard examples，但模型从中学不到规律。
+4. VF-Distill v2 之所以有效是因为它训练「VF 覆盖 LLM 的一致模式」（一个有规则的决策边界），而不是「VF 的所有最优选择」。
+
+### AESL Entropy Early-Stopping（2 组）— 20% / 0%
+
+**做法**：在 5,000 例 AB-SFT 子集（从 17,050 例中采样）上 1 epoch 训练，每步记录熵与 loss，训练 step=150（entropy 峰值）与 step=500（best loss）两个 checkpoint 都评估。
+
+**结果**：Best-Loss (step=500) 2/10 (20%)，Entropy-Peak (step=150) 0/10 (0%)。
+
+**失败原因**：AESL 假设来自数学推理（长 CoT 输出数千 token），卡坦是 ~6 token 的 JSON 输出（`{"action_number": 5}`），熵动力学根本不同。step=150 的「高峰」反映的是「还没学会」，不是「多样性强」。且没有 RL 阶段（GRPO 在本任务失败），熵对后训练性能的预测能力失效。
+
+### Option C Curriculum（outcome label 课程）— 14% / 38% / 0%
+
+**做法**：三组自博弈课程实验：
+
+- warm-start 从 `rl_enriched_model.pt` 出发 → sigmoid + BCELoss 训 1000 episodes
+- fresh-start（base 模型）→ sigmoid + BCELoss 训 500 episodes
+- VF 残差课程 — 公式有 bug 未完成
+
+**结果**：warm-start vs Random 38% / vs WeightedRandom 14% / vs AlphaBeta 0%；fresh-start vs Random 12% / vs WeightedRandom 8% / vs AlphaBeta 0%；VF 残差实验因 loss=9e13 在早期停止。
+
+**失败原因**：
+
+- 训练指标完美（correlation 0.83、action spread 0.074、flat 决策 0%），但模型对动作打分与胜率无关——只是学会了「4 人局平均胜率 ~25% + 高置信度」
+- VF 残差实验公式 bug：「`VP * VP_WEIGHT` 写成了 `VP_WEIGHT` 单项」（6 个数量级的常量），导致 loss 爆炸。修复后公式应为 `(VF - vp * VP_WEIGHT) / 1e8`
+- 4 人 Catan 中 ~75% 状态来自输家，win/loss label 本身是噪声
+- warm-start 从 VF 残差（[-1, 2] 线性输出）切到 sigmoid（[0, 1]）初始化错位，进一步放大噪声
+
+### Hybrid Agent（tools + RL guard）— 0% (0/3)
+
+**做法**：同 Hybrid Agent（tools + VF），但用 RL Model Fixed 后的 `rl_enriched_model.pt` 替代 `contender_fn` 作 guardrail。
+
+**结果**：3 局全败。局长 155–350 回合，慢速输掉。
+
+**失败原因**：尽管 RL 模型修复后整体胜率 44%，但修路决策上仍 flat（同 RQ6 残留盲区）。当 RL guard 强制改 LLM 的提议时，往往改成另一个「同样不优」的路段，加速劣势累积。
+
+### Hybrid Agent（tools only，无 guard）— 67% (2/3)
+
+**做法**：4 工具照常调用，LLM 提议即最终动作。
+
+**结果**：2/3 胜率，局长 131–445 回合（比 tools+VF 长，比 tools+RL 短）。
+
+**意义**：工具已经把胜率从 25% 推到 67%（提升 42 个百分点），证明「外部计算注入观察」有效；guardrail 再贡献 33 个百分点（67% → 100%）。
+
+---
+
 ## 复现
 
 环境：Python ≥ 3.10，PyTorch ≥ 2.1，NVIDIA RTX 4090 D 24GB（AutoDL 容器）。
