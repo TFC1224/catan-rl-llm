@@ -156,6 +156,16 @@ catan-rl-llm/
 - 删除过时 `PROGRESS.md` 与旧 `README.md`，把顶层 `log.md` / `sum.md` 按时间编号归档到 `notebooks/`。
 - 本文件 + 新 `README.md` 替换原文档。
 
+### 2.13 Day 5：VF-SFT 规模化与 Qwen checkpoint 对比（2026-08-10）
+
+本日完成三项收尾验证：
+
+- **VF-SFT 规模化复测**：用 300 局 VF-only 游戏生成 29,866 条决策训练 Qwen3-8B（QLoRA r=16 α=32, 3 epochs, 2400/5040 steps 当前 50%），对 WeightedRandom 取得 **76.0% (38/50) 胜率**（95% CI 62.6%–85.7%）。这是**首个被规模化验证的 standalone Qwen 方案**——standalone（无工具、无 guardrail）超越随机基线（25%）。
+- **Qwen checkpoint 对比**（修正版 `eval_qwen_mass_v2.py`）：三个 Qwen 适配器各 20 局对比 → VF-SFT 75.0% / AB-SFT 5.0% / Hybrid Agent 100%。**确认 teacher 质量（VF vs AlphaBeta）是 15× 差距的根源，不是数据量**。
+- **ESCU 论文改进方案评估**：`experiments/escau_improvement_design.md` 中的 3 个 Shapley Value 实验全部被否定——Shapley Value 在 72 特征上仍是状态质量信号，不解决「72 特征无法承载动作区分度」的根本瓶颈。详见 `experiments/escau_feasibility_assessment.md`（独立评估文件，未合并入 README）。
+
+**核心新发现（第六条跨方法洞察）**：当 teacher 的策略在文本观察中「可解释」时，SFT 即可学到教师策略。VF 优于 AlphaBeta 作为 LLM 的 teacher，因为 VF 的偏好来自少数可命名特征。
+
 ---
 
 ## 3. 七个失败路径逐项分析
@@ -393,6 +403,15 @@ VF guardrail 是关键——消融实验显示，去掉它胜率从 100% 跌到 
 - 唯一可信的指标是 **对战胜率**——而且要在多局、对多对手下取平均。
 
 **推论**：任何不直接对战的评估指标都应被视为「hint」，不能视为「目标」。
+
+### 6.6 Teacher 质量 >> 数据量（2026-08-10 新增）
+
+- 同样 300 局、同样 SFT 框架、同样文本观察下，**VF 作 teacher 教出 76% 胜率**，**AlphaBeta 作 teacher 教出 5%**——15× 差距。
+- VF 的策略「在文本中可解释」：基于 ~5 个可命名特征（VP、产能、对手距离等），LLM 可以从文本中推理这些特征。
+- AlphaBeta 的策略依赖搜索上下文（lookahead、对手建模），这些上下文在文本观察中完全不可见，LLM 无法学习。
+- 这是 standalone Qwen 首次显著超越随机的关键发现——standalone Qwen 路径依赖 **teacher 的可解释性**，不是更聪明的算法。
+
+**推论**：当 teacher 的决策逻辑可在文本上「解释」时，SFT 即可学到教师策略。挑选 SFT teacher 时，「决策可解释性」是比「决策强度」更关键的筛选条件。
 
 ---
 

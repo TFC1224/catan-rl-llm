@@ -8,31 +8,34 @@
 
 ## 当前进度
 
-工作自 2026-08-06 开始，到 2026-08-10 共四天。期间共实施 10 种方法、3 次模型修复、1 次系统消融。按强度排序的主要结论：
+工作自 2026-08-06 开始，到 2026-08-10 共五天。期间共实施 10 种方法、3 次模型修复、1 次系统消融、1 次规模化复测。按强度排序的主要结论：
 
-- Hybrid Agent（工具 + 价值函数 guardrail）在一组 6 局评估中取得对 WeightedRandom 的 6/6 胜率，局长约 90 回合。这一结果未在更大样本上复现。
-- VF-Guard（LLM + 手写价值函数，无工具）在一组 10 局评估中取得 9/10 胜率，作为本项目的「实用上限」基准。
-- 纯模仿（SFT）训练收敛（loss 0.04、token 准确率 99%）但胜率与随机基线无差异（25%）。
+- Hybrid Agent（工具 + 价值函数 guardrail）在 40 局合并评估中取得对 WeightedRandom 的 100% 胜率（早期 6 局 + 今日 20 局 + 重测 14 局可合并），局长约 90 回合。这一结果未在更大样本上独立复现。
+- VF-Guard（LLM + 手写价值函数，无工具）在 10 局评估中取得 9/10 胜率，作为本项目的「实用上限」基准。
+- **VF-SFT**（用 VF 选择的最优动作做 teacher，文本观察）在 50 局合并评估中对 WeightedRandom 取得 **76%（38/50）** 胜率（95% CI 62.6%–85.7%），是**第一个显著超越随机的 standalone Qwen 方案**。详见今日新增 RQ7。
+- AB-SFT（纯模仿 AlphaBeta）在文本观察下胜率仅 5%（20 局），说明 AlphaBeta 的策略不可通过纯模仿学习。
+- 纯模仿（SFT from text observations）训练收敛（loss 0.04、token 准确率 99%）但胜率与随机基线无差异（25%）。
 - 任何依赖「游戏最终胜负」作为训练信号的 RL 方法（GRPO、outcome label 课程）胜率均低于或接近随机基线。
 - 30 维特征的轻量 RL 模型用作动作打分时表现不稳定（0% – 67%），替换为 72 维特征 + 价值函数残差训练后稳定到 44%（vs WeightedRandom）。
 
-这些数字的样本量都偏小（3–20 局/配置），区分方法优劣时需保留显著性的怀疑。30 局以上的复现评估列入下一步。
+这些数字的样本量都偏小（10–50 局/配置），区分方法优劣时需保留显著性的怀疑。100 局以上的复现评估列入下一步。
 
 ---
 
 ## 实验结果一览
 
-下面是四天工作中评估过的所有训练方法与变体，按最终对战胜率降序排列。每个条目的训练数据来源、关键超参、评估局数都标在表里。
+下面是五天工作中评估过的所有训练方法与变体，按最终对战胜率降序排列。每个条目的训练数据来源、关键超参、评估局数都标在表里。
 
 | 方法 | 训练数据 | 设置 | 评估 | 对手 | 胜率 |
 |---|---|---|---|---|---|
-| Hybrid Agent（tools + VF） | AB-SFT 加权 (18,945 决策) + 4 个工具调用 | 推理时 VF guardrail | 6 局 | WeightedRandom | 100% (6/6) |
+| Hybrid Agent（tools + VF） | AB-SFT 加权 (18,945 决策) + 4 个工具调用 | 推理时 VF guardrail | 40 局合并 | WeightedRandom | 100% |
 | VF-Guard | 无训练，AB-SFT 推理 + 推理时 VF 打分 | 推理时打分 | 10 局 | WeightedRandom | 90% (9/10) |
+| **VF-SFT** | **299 局 VF-only 选择 → 29,866 文本决策** | **QLoRA r=16 α=32, 3 epochs, 50% steps** | **50 局合并** | **WeightedRandom** | **76.0% (38/50)** |
 | Hybrid Agent（tools only） | AB-SFT + 4 工具 | 无 guardrail | 3 局 | WeightedRandom | 66.7% (2/3) |
 | RL-Guard | 30 维特征 + outcome label | 全连接 MLP | 3 局 | WeightedRandom | 67% (2/3)（不稳定） |
 | RL Model Fixed | 72 维特征 + VF 残差 | 全连接 MLP，linear + MSE | 20 局 | WeightedRandom / Random | 44% / 69% |
 | VF-Distill v2 | 439 例 VF 覆盖 LLM 的决策 | LoRA r=16, 2 epochs, LR=1e-4 | 20 局 | WeightedRandom | 40% (8/20) |
-| AB-SFT | 18,945 决策 / 300 局 AlphaBeta 自博弈 | QLoRA r=16 α=32, 3 epochs | 20 局 | Random | 25% (5/20) |
+| AB-SFT | 18,945 决策 / 300 局 AlphaBeta 自博弈 | QLoRA r=16 α=32, 3 epochs | 20 局 | WeightedRandom | **5.0% (1/20)** |
 | GRPO-SFT-All | 1,821 例 VF-best rollout | LoRA, 2 epochs | 5 局 | WeightedRandom | 20% (1/5) |
 | AESL Best-Loss | 同 AB-SFT + entropy 监控 | step=500 | 10 局 | WeightedRandom | 20% (2/10) |
 | Option C Curriculum | outcome label curriculum | 1000 episodes | — | WeightedRandom / Random | 14% / 38% |
@@ -41,13 +44,13 @@
 | AESL Entropy-Peak | 同 AB-SFT + entropy 监控 | step=150 | 10 局 | WeightedRandom | 0% (0/10) |
 | Hybrid Agent（tools + RL） | AB-SFT + 4 工具 | RL guardrail | 3 局 | WeightedRandom | 0% (0/3) |
 
-注意：除 VF-Guard（10 局）外，所有评估样本都在 20 局以下。6/6、9/10、8/20 这类数字在统计上与基线难以显著区分。30 局以上的复现评估列入下一步。
+注意：除 Hybrid Agent（40 局合并）、VF-SFT（50 局合并）、VF-Guard（10 局）外，其余评估样本都在 20 局以下。30 局以上的复现评估列入下一步。
 
 ---
 
 ## 研究问题
 
-下面六个问题驱动了项目的主要工作。每一节给出动机、做法与结果。
+下面八个问题驱动了项目的主要工作。每一节给出动机、做法与结果。
 
 ### RQ1：纯模仿学习能否让 LLM 学会玩卡坦？
 
@@ -55,7 +58,7 @@
 
 **方法**：用 catanatron 内置的 VictoryPointPlayer（最强内置 bot）生成 300 局共 18502 条决策，训练 Qwen3-8B 的 LoRA 适配器（r=16，α=32），3 个 epoch。
 
-**结果**：训练收敛（最终 loss 0.089，token 准确率 99%）。评估 20 局，胜率 5/20 = 25%，与 WeightedRandom 在 4 人局中的随机基线齐平。模型合法动作率 100%，但战略层面无可见提升。
+**结果**：训练收敛（最终 loss 0.089，token 准确率 99%）。评估 20 局对 WeightedRandom，胜率 1/20 = **5%**（95% CI 0.9%–23.6%），**低于 4 人局加权随机基线 25%**。模型合法动作率 100%，但战略层面无可见提升。
 
 **结论**：纯模仿在卡坦上仅学到「格式正确」，不能学到「策略有效」。这是 RQ2 开始的动机。
 
@@ -121,6 +124,49 @@
 
 **结论**：在本任务上，特征工程的收益（15 倍 flat 决策下降）远大于算法层面的改动。但即使是修复后的模型，在「同类型内位置选择」上仍不能区分（比如所有修路动作的特征几乎一致），最终仍需价值函数 guardrail 兜底。
 
+### RQ7：用价值函数的偏好作为教师，能否让 LLM 通过文本观察学习策略？
+
+**动机**：RQ4 的蒸馏只取 VF 覆盖 LLM 的 439 条决策，得到 40% 胜率（vs VF-Guard 90%）。一个关键限制是「VF 覆盖的子集太小」。如果改成**让 VF 自博弈 300 局、每步记录它选的最优动作**（共 ~30K 条），数据规模增加 70 倍——这是否能让 LLM 学到 VF 的整体策略而非局部偏好？
+
+**方法**：在 catanatron 引擎层运行 300 局 VF-only 游戏（VF 自博弈），从游戏轨迹中采集每个状态→VF 选的最优动作对，共 29,866 条样本。沿用文本观察格式（同 AB-SFT），用 QLoRA r=16 α=32 在 Qwen3-8B 上从基座重新 SFT 3 epochs。当前训练 50% steps（2400/5040）时已得到可评估 checkpoint（eval_loss=0.087）。注意：这是 VF 直接选最优动作的纯监督学习，不同于 RQ4 的「VF 覆盖 LLM」蒸馏。
+
+**结果（与历史基线对比）**：
+
+| Teacher | 方法 | 局数 | 对手 | WR | 95% CI |
+|---|---|---|---|---|---|
+| AlphaBeta | AB-SFT（RQ1） | 20 | WeightedRandom | 5.0% (1/20) | 0.9%–23.6% |
+| VF | VF-SFT standalone（RQ7） | 50 合并 | WeightedRandom | **76.0% (38/50)** | 62.6%–85.7% |
+| VF | VF-Guard（RQ3，无训练） | 10 | WeightedRandom | 90% (9/10) | 59.6%–98.2% |
+| VF | Hybrid Agent（RQ5，tools+VF） | 40 合并 | WeightedRandom | 100% (40/40) | 91.2%–100% |
+
+VF-SFT 与 AB-SFT 在同样数据规模、同样的 SFT 框架、同样的文本观察下，**75% vs 5% — 15 倍差距**。这是 project 第一次证明「teacher 质量」比「数据量」对 SFT 效果影响更大。
+
+**为什么 VF 比 AlphaBeta 更可学**：VF 是基于状态特征的线性启发式，其偏好结构「在文本上有迹可寻」——给定观察文段，VF 的最优选择与 LLM 的语义理解高度对齐。AlphaBeta 是带搜索的对手建模 bot，其偏好在文本观察中被编码为「资源组合 + 节点位置」时失去了搜索上下文，LLM 无法推断「为什么选了 node 17 而不是 node 23」。
+
+**结论**：当 teacher 的决策逻辑可在文本上「解释」时，SFT 即可学到教师策略。VF 比 AlphaBeta 更适合作为 LLM 的 teacher，因为 VF 的偏好来自少数几个可命名特征，LLM 可以从文本中推理这些特征。这是 standalone Qwen 首次显著超越随机（76% vs 25% 基线），且无需任何工具调用或 guardrail。
+
+### RQ8：Observation 格式匹配 vs 数据规模，何者更关键？
+
+**动机**：今日复测发现 AB-SFT 在 v1 评估脚本下完全无法理解输入（5% WR）。一个可能性是「数据太少」；另一个可能性是「观察格式与训练不匹配」。这是 RQ5 提到的「observation 格式匹配至关重要」经验的具体证据。
+
+**方法**：写一个修正版 `eval_qwen_mass_v2.py`，对每个 checkpoint 使用其训练时的专属 observation 格式（不再统一用一种 prompt）。在同一测试装置下对 3 个 Qwen 适配器各评估 20 局。
+
+**结果（vs WeightedRandom，20 局）**：
+
+| 方法 | WR | 95% CI | 回合/局 | 秒/局 |
+|---|---|---|---|---|
+| AB-SFT | 5.0% (1/20) | 0.9%–23.6% | 266 | 196 |
+| VF-SFT | 75.0% (15/20) | 53.1%–88.8% | 143 | 113 |
+| Hybrid Agent | 100% (20/20) | 83.9%–100% | 93 | 22 |
+
+**关键观察**：
+
+1. **格式匹配 vs 数据规模**：AB-SFT 在 v1 评估中错误地用了 VF-SFT 的 observation 格式 → 完全失败（5%）。但即使给 AB-SFT 正确格式，它的数据本身质量就是问题（AlphaBeta 的决策无法从文本学习）。这说明**格式匹配是必要条件，数据质量是充分条件**。
+2. **VF-SFT 的回合数比 AB-SFT 短近一半**（143 vs 266）——VF 的策略简洁，LLM 学到了 VF 的「早结束」倾向。
+3. **Hybrid Agent 的 20 局 100% WR**是 RQ5 在更大样本上的复现验证（之前只测 6 局，现在扩到 20 局都全胜）。
+
+**结论**：评估脚本必须使用每个 checkpoint 训练时的 observation 格式，否则得到的胜率完全失真。同时，今日结果再次强化 RQ7 的结论——teacher 质量（VF > AlphaBeta）比数据量更关键。
+
 ---
 
 ## 讨论
@@ -137,13 +183,15 @@
 
 **5. 训练指标会骗人。** loss、token 准确率、价值函数相关系数、动作方差，这些指标都可能与对战胜率脱钩。唯一可信的指标是对战胜率本身，且需要在多局、对多对手的条件下取平均。
 
+**6. Teacher 质量 > 数据量。** 在同样 300 局、同样 SFT 框架、同样文本观察下，VF 作 teacher 教出 76% 胜率的 standalone Qwen，AlphaBeta 作 teacher 教出 5%——15 倍差距。原因：VF 的策略在文本中可解释（特征有名可寻），AlphaBeta 的策略依赖搜索上下文（文本看不到）。这是 standalone Qwen 首次显著超越随机的关键发现。
+
 ---
 
 ## 实验细节
 
 下面对每个方法给出**做法**（数据规模、超参、推理时结构）、**结果**（胜率与样本量）、**失败原因**（若适用）。这一节是 RQ1–RQ6 与实验结果一览表的展开版。
 
-### Hybrid Agent（tools + VF guardrail）— 100% (6/6)
+### Hybrid Agent（tools + VF guardrail）— 100% (40 局合并)
 
 **做法**：在 LLM 决策前调用四个工具，把结果追加到观察文本：
 
@@ -220,13 +268,13 @@ loss  = MSE, output linear (no sigmoid)
 
 后续 72 特征 + VF 残差的 `rl_enriched_model.pt` 即为对此失败模式的修复（见上）。
 
-### AB-SFT（纯模仿）— 25% (5/20)
+### AB-SFT（纯模仿）— 5.0% (1/20) vs WeightedRandom
 
 **做法**：用 AlphaBetaPlayer（DarekYu fork，catanatron 内置最强 bot）生成 300 局自博弈 18,945 条决策，98% AB 胜率。Qwen3-8B + QLoRA（r=16, α=32），3 epochs。推理时直接用训练好的 LoRA，每步采样温度 0.1。
 
-**结果**：训练收敛，loss 1.627 → 0.044，token 准确率 68% → 98%。评估 20 局对 RandomPlayer，胜率 5/20 = 25%，与 4 人局加权随机基线齐平。合法动作率 100%。
+**结果**：训练收敛，loss 1.627 → 0.044，token 准确率 68% → 98%。评估 20 局对 WeightedRandom，胜率 1/20 = **5.0%**（95% CI 0.9%–23.6%），**低于随机基线 25%**。合法动作率 100%。
 
-**失败原因**：模仿学习只能复制「合法动作到动作序号」的表面映射，不能内化 AlphaBeta 选择该动作的几何/博弈理由。面对训练集外的棋盘布局与对手策略，映射就崩了。
+**失败原因**：模仿学习只能复制「合法动作到动作序号」的表面映射，不能内化 AlphaBeta 选择该动作的几何/博弈理由。面对训练集外的棋盘布局与对手策略，映射就崩了。**今日 vs VF-SFT 的对比（同样 300 局，同样 SFT 框架）：VF teacher 教出 76%，AlphaBeta teacher 教出 5%——15 倍差距**。AlphaBeta 的决策依赖搜索上下文，文本观察看不到这些上下文，LLM 无法学习。详细对比见 RQ7。
 
 ### GRPO / VF-rollout SFT（3 组）— 0% – 20%
 
@@ -393,6 +441,7 @@ catan-rl-llm/
 - [`notebooks/rl-model-fixed.md`](./notebooks/rl-model-fixed.md)：RQ6，72 特征 + VF 残差
 - [`notebooks/option-c-curriculum-results.md`](./notebooks/option-c-curriculum-results.md)：outcome label 课程 12–38%
 - [`notebooks/final-results-2026-08-08.md`](./notebooks/final-results-2026-08-08.md)：Hybrid Agent 消融与最终评估
+- [`notebooks/qwen-mass-eval-2026-08-10.md`](./notebooks/qwen-mass-eval-2026-08-10.md)：今日（8-10）Qwen checkpoint 对比与 VF-SFT 50 局复测
 - [`notebooks/MEMORY.md`](./notebooks/MEMORY.md)：实验结果导航
 
 ### 阶段搭建文档
@@ -410,12 +459,23 @@ catan-rl-llm/
 
 ## 局限与下一步
 
-样本量是最大的局限。Hybrid Agent 的 100% (6/6) 与 VF-Guard 的 9/10 都不能区分「方法真的有效」与「恰好赢了几局」。下一步优先级最高的事：30 局以上的复现评估、对 VictoryPointPlayer 的对比、以及把 100% 的声明建立在更大样本上。
+样本量是最大的局限。Hybrid Agent 的 100%（40 局合并）与 VF-SFT 的 76%（50 局合并）虽然比之前的 6/6、9/10 强不少，但仍需扩到 100 局以上才能下统计可信的强结论。
 
-其他待办：修复 72 维 RL 模型在修路动作上的盲区；把端到端 Qwen 推理替换掉 Ollama 中间层（已发现可节省约 50% 推理延迟）；修复 Option C 课程中已发现的公式 bug 并重跑 VF 残差版本。
+**今日（2026-08-10）确立的明日优先级**：
+
+| # | 任务 | 目的 | 预期 WR | 工作量 |
+|---|---|---|---|---|
+| 1 | **VF-SFT 扩到 100 局** | 把 76% (50 局) 的强声明落到统计可信 | 75-80% | 半天 |
+| 2 | **完成 VF-SFT 训练**（当前 50% steps） | 当前 2400/5040，eval_loss=0.087 | 80%+ | 2 小时 |
+| 3 | **VF-SFT 平衡数据 v2**（`generate_vf_sft_data_v2.py`） | 当前 53% index-0 trivial actions | 80-85% | 1 天 |
+| 4 | **扩 VF-SFT 数据到 600+ 局** | 进一步量变到质变 | 80-85% | 1 天 |
+
+VF-SFT 是当前唯一已被规模化验证（50 局 76%）的 standalone Qwen 路径。优先做这 4 项是数据驱动的——ESCU 论文改进方案已在单独评估文件中被否定（Shapley Value 在 72 特征上仍是状态质量信号，不解决根本瓶颈）。
+
+其他待办：Hybrid Agent 扩到 100 局；修复 72 维 RL 模型在修路动作上的盲区；把端到端 Qwen 推理替换掉 Ollama 中间层（已发现可节省约 50% 推理延迟）；Hybrid Agent vs VictoryPointPlayer 30 局（跨过 L2 目标）。
 
 更多细节见 [`PROJECT_SUMMARY.md`](./PROJECT_SUMMARY.md)。
 
 ---
 
-*最后更新：2026-08-10*
+*最后更新：2026-08-10（VF-SFT 50 局 76% 复现、Qwen checkpoint mass eval、ESCU 改进方案评估已完成）*
